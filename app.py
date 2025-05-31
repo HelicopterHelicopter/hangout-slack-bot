@@ -92,7 +92,7 @@ SIMILARITY_THRESHOLD = 0.7 # Adjust as needed (cosine similarity, higher is more
 
 # --- Ollama Configuration ---
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL_NAME = os.environ.get("OLLAMA_MODEL_NAME", "tinyllama") # Ensure this model is pulled in Ollama
+OLLAMA_MODEL_NAME = os.environ.get("OLLAMA_MODEL_NAME", "qwen:4b") # CHANGED DEFAULT TO QWEN:4B
 OLLAMA_REQUEST_TIMEOUT = 60 # Seconds to wait for Ollama response
 
 # Initialize Sentence Transformer model
