@@ -87,7 +87,7 @@ db.migrate_poll_responses_table()
 
 # --- Q&A Knowledge Base Setup ---
 KNOWLEDGE_BASE_FILE = "knowledge_base.txt"
-EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 SIMILARITY_THRESHOLD = 0.7 # Adjust as needed (cosine similarity, higher is more similar)
 
 # --- Ollama Configuration ---
