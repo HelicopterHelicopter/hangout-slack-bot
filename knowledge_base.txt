@@ -1,0 +1,19 @@
+# Add questions starting with 'Q: ' and answers with 'A: '
+# Example:
+# Q: What is our company's mission?
+# A: To innovate and lead in our industry.
+
+Q: What are the company's core values?
+A: Our core values are customer obsession, innovation, and integrity.
+
+Q: Where is the company headquarters located?
+A: The company headquarters is in San Francisco, California.
+
+Q: How can I reset my password?
+A: You can reset your password by going to the login page and clicking on the 'Forgot Password' link. Follow the instructions sent to your email.
+
+Q: What are the support hours?
+A: Support is available from 9 AM to 5 PM PST, Monday to Friday. For urgent issues outside these hours, please consult the emergency contact list.
+
+Q: Does the company offer remote work options?
+A: Yes, the company offers flexible remote work options for many roles. Please check with your manager or HR for specific policies related to your position. 

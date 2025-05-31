@@ -8,6 +8,11 @@ from dateutil import parser
 import logging
 import re
 import json # Add json import if needed for formatting, using YAML here
+from sentence_transformers import SentenceTransformer # Added for Q&A
+import faiss # Added for Q&A
+import numpy as np # Added for Q&A
+import uuid # Though Chroma not used, uuid might be useful elsewhere. Keeping for now.
+import requests # Added for Ollama integration
 
 # Set up logging to debug the issue
 logging.basicConfig(level=logging.DEBUG)
@@ -19,7 +24,20 @@ load_dotenv()
 # Check if we're in test mode
 TEST_MODE = os.environ.get('TEST_MODE', 'False').lower() == 'true'
 
-channel_name = os.environ.get('SLACK_CHANNEL')
+# SLACK_CHANNEL is used by other parts of the app, e.g., for posting general announcements
+# For Q&A, we'll use a new variable for a list of channels to listen to.
+channel_name = os.environ.get('SLACK_CHANNEL') # This might be the *primary* channel for other functions
+
+# Define a list of channel IDs the bot should listen to for Q&A
+# Example: SLACK_LISTEN_CHANNEL_IDS="C12345,C67890"
+raw_listen_channel_ids = os.environ.get("SLACK_LISTEN_CHANNEL_IDS", "")
+if raw_listen_channel_ids:
+    ALLOWED_CHANNEL_IDS = [channel_id.strip() for channel_id in raw_listen_channel_ids.split(',') if channel_id.strip()]
+    logger.info(f"Q&A bot will listen on specific channel IDs: {ALLOWED_CHANNEL_IDS}")
+else:
+    ALLOWED_CHANNEL_IDS = ["C08JYMY3V9R"] # Empty list means listen to all channels (current behavior)
+    logger.info("SLACK_LISTEN_CHANNEL_IDS not set or empty. Q&A bot will listen on all channels it is a member of.")
+
 
 ADMIN_USER_ID = "U07ADRA6HEH" # User ID to receive the DM
 
@@ -30,6 +48,7 @@ if TEST_MODE:
             self.commands = {}
             self.views = {}
             self.actions = {}
+            self.events = {} # Added for message event
             
         def command(self, cmd):
             def decorator(func):
@@ -48,6 +67,12 @@ if TEST_MODE:
                 self.actions[action_id] = func
                 return func
             return decorator
+
+        def event(self, event_type): # Added for message event
+            def decorator(func):
+                self.events[event_type] = func
+                return func
+            return decorator
     
     app = MockApp()
     print("Running in TEST MODE - no Slack connection will be established")
@@ -59,6 +84,150 @@ else:
 db.init_db()
 # Run migration to update poll_responses table if needed
 db.migrate_poll_responses_table()
+
+# --- Q&A Knowledge Base Setup ---
+KNOWLEDGE_BASE_FILE = "knowledge_base.txt"
+EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+SIMILARITY_THRESHOLD = 0.7 # Adjust as needed (cosine similarity, higher is more similar)
+
+# --- Ollama Configuration ---
+OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL_NAME = os.environ.get("OLLAMA_MODEL_NAME", "tinyllama") # Ensure this model is pulled in Ollama
+OLLAMA_REQUEST_TIMEOUT = 60 # Seconds to wait for Ollama response
+
+# Initialize Sentence Transformer model
+sentence_model = None
+faiss_index = None
+qa_store = [] # Stores {'question': q, 'answer': a} dicts
+
+def load_knowledge_base_faiss():
+    global sentence_model, faiss_index, qa_store
+    logger.info(f"Loading knowledge base from {KNOWLEDGE_BASE_FILE} and building FAISS index...")
+    
+    try:
+        sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    except Exception as e:
+        logger.error(f"Failed to load SentenceTransformer model '{EMBEDDING_MODEL_NAME}': {e}")
+        return
+
+    questions = []
+    current_q = None
+    current_a = None
+
+    if not os.path.exists(KNOWLEDGE_BASE_FILE):
+        logger.warning(f"{KNOWLEDGE_BASE_FILE} not found. Q&A feature will be disabled.")
+        # Create an empty file to avoid errors on subsequent runs if user wants to add Q&A later
+        with open(KNOWLEDGE_BASE_FILE, 'w') as f:
+            f.write("# Add questions starting with 'Q: ' and answers with 'A: '\n")
+            f.write("# Example:\n")
+            f.write("# Q: What is our company's mission?\n")
+            f.write("# A: To innovate and lead in our industry.\n")
+        return
+
+    try:
+        with open(KNOWLEDGE_BASE_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("Q:"):
+                    if current_q and current_a: # Save previous Q&A
+                        qa_store.append({"question": current_q, "answer": current_a})
+                        questions.append(current_q)
+                    current_q = line[3:].strip()
+                    current_a = None # Reset answer for the new question
+                elif line.startswith("A:") and current_q:
+                    current_a = line[3:].strip()
+                elif current_a: # Handle multi-line answers
+                    current_a += "\n" + line
+
+            if current_q and current_a: # Save the last Q&A pair
+                qa_store.append({"question": current_q, "answer": current_a})
+                questions.append(current_q)
+        
+        if not questions:
+            logger.info("No Q&A pairs found in the knowledge base.")
+            return
+
+        logger.info(f"Found {len(questions)} questions. Generating embeddings...")
+        question_embeddings = sentence_model.encode(questions, convert_to_tensor=False)
+        
+        # FAISS expects float32
+        question_embeddings = np.array(question_embeddings).astype('float32')
+
+        # Normalize embeddings for cosine similarity with IndexFlatIP
+        faiss.normalize_L2(question_embeddings)
+
+        embedding_dim = question_embeddings.shape[1]
+        faiss_index = faiss.IndexFlatIP(embedding_dim) # IP (Inner Product) is equivalent to Cosine Similarity for normalized vectors
+        faiss_index.add(question_embeddings)
+        
+        logger.info(f"FAISS index built successfully with {faiss_index.ntotal} entries.")
+        logger.info(f"qa_store populated with {len(qa_store)} entries.")
+
+    except Exception as e:
+        logger.error(f"Error loading knowledge base or building FAISS index: {e}")
+        faiss_index = None # Ensure index is None if setup fails
+        qa_store = []
+
+# --- Generate response with Ollama ---
+def generate_response_with_ollama(user_question, context_answer):
+    logger.info(f"Attempting to generate response with Ollama model: {OLLAMA_MODEL_NAME}")
+    
+    # System prompt can be adjusted. Some models work better with it, some without.
+    # For TinyLlama and many chat models, a system prompt is beneficial.
+    system_prompt = ("You are a helpful Slack bot. Given a user's question and a relevant piece of information (context) from a knowledge base, "
+                     "provide a concise and friendly answer to the user's question. Base your answer *only* on the provided context. "
+                     "If the context doesn't directly answer the question, state what information you found and that it might not be a direct answer. "
+                     "Do not make up facts or information beyond the context. Avoid repeating the context verbatim unless it perfectly answers the question.")
+
+    # Constructing the prompt for Ollama. The exact format might vary slightly based on the model.
+    # This format is common for instruction-following or chat models.
+    full_prompt = (f"System: {system_prompt}\n\n"
+                   f"Context: {context_answer}\n\n"
+                   f"User Question: {user_question}\n\n"
+                   f"Assistant Response:")
+
+    payload = {
+        "model": OLLAMA_MODEL_NAME,
+        "prompt": full_prompt,
+        "stream": False, # We want the full response, not a stream
+        "options": {
+            "num_predict": 150, # Max tokens to generate, similar to max_new_tokens
+            "temperature": 0.7,
+            "top_k": 50,
+            "top_p": 0.9
+            # Add other Ollama options here if needed, e.g., "stop": ["User Question:", "\n\n"]
+        }
+    }
+
+    try:
+        logger.debug(f"Ollama Request Payload:\n{json.dumps(payload, indent=2)}")
+        response = requests.post(OLLAMA_API_URL, json=payload, timeout=OLLAMA_REQUEST_TIMEOUT)
+        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+
+        response_data = response.json()
+        llm_response = response_data.get("response", "").strip()
+        
+        logger.info(f"Ollama generated response: {llm_response}")
+        if not llm_response:
+            logger.warning("Ollama returned an empty response.")
+            return "I found some information, but I'm having a bit of trouble formulating a response right now via Ollama. Here is the direct information: \n\n" + context_answer
+        return llm_response
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout connecting to Ollama API at {OLLAMA_API_URL}.")
+        return "Sorry, I couldn't reach my brain (Ollama) in time to answer that. Please try again later."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling Ollama API: {e}")
+        return f"Sorry, I encountered an error trying to connect to my brain (Ollama) to answer your question. Error: {e}"
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON response from Ollama: {e}. Response was: {response.text}")
+        return "Sorry, I received an unexpected response from my brain (Ollama)."
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in generate_response_with_ollama: {e}")
+        return "An unexpected error occurred while I was thinking. Please try again."
+
+# Load knowledge base on startup
+load_knowledge_base_faiss()
 
 # Add middleware to log all incoming requests for better debugging
 @app.middleware
@@ -1397,10 +1566,104 @@ def handle_archive_request_submission(ack, body, client, view, logger):
         except Exception as inner_e:
              logger.error(f"Failed to send error notification to user {requester_user_id}: {inner_e}")
 
+# --- Q&A Message Handler ---
+@app.event("message")
+def handle_message_events(body, client, logger):
+    print("--- handle_message_events WAS TRIGGERED ---") # Temporary diagnostic print
+    logger.debug("--- handle_message_events WAS TRIGGERED ---") # Also log it
+    event = body.get("event", {})
+    message_text = event.get("text")
+    user_id = event.get("user")
+    channel_id = event.get("channel")
+    thread_ts = event.get("ts") # Use 'ts' for threading replies
+
+    # Ignore messages from bots (including self) or messages without text
+    if event.get("bot_id") or not message_text or not user_id:
+        return
+
+    # Check if Q&A is restricted to specific channels
+    if ALLOWED_CHANNEL_IDS: # If the list is populated, check against it
+        if channel_id not in ALLOWED_CHANNEL_IDS:
+            logger.debug(f"Message in channel {channel_id} is not in the allowed list of Q&A channels: {ALLOWED_CHANNEL_IDS}. Ignoring.")
+            return
+    else: # If ALLOWED_CHANNEL_IDS is empty, retain original behavior (listen to all channels the bot is in)
+        pass # Explicitly do nothing, proceed to Q&A
+
+    logger.debug(f"Received message from user {user_id} in channel {channel_id}: '{message_text}'")
+
+    if not faiss_index or not sentence_model or not qa_store:
+        logger.debug("Q&A feature not initialized (FAISS index, model, or qa_store missing).")
+        # Optionally, you could reply that the Q&A feature is down.
+        return
+
+    try:
+        # Generate embedding for the incoming message
+        message_embedding = sentence_model.encode([message_text], convert_to_tensor=False)
+        message_embedding = np.array(message_embedding).astype('float32')
+        faiss.normalize_L2(message_embedding) # Normalize for IndexFlatIP
+
+        # Search FAISS index
+        # k=1 to get the single best match
+        # D are distances (inner product scores), I are indices
+        D, I = faiss_index.search(message_embedding, k=1) 
+        
+        best_match_index = I[0][0]
+        similarity_score = D[0][0]
+
+        logger.debug(f"Query: '{message_text}', Best match index: {best_match_index}, Score: {similarity_score}")
+
+        if similarity_score >= SIMILARITY_THRESHOLD:
+            retrieved_qa = qa_store[best_match_index]
+            answer = retrieved_qa["answer"]
+            
+            # Generate response with Ollama
+            llm_generated_response = generate_response_with_ollama(message_text, answer)
+
+            response_text = llm_generated_response if llm_generated_response else answer # Fallback to direct answer
+            
+            # For debugging, include the question it matched with and similarity score
+            # matched_question = retrieved_qa["question"]
+            # debug_info = f"\n\n(Matched: '{matched_question}' | Score: {similarity_score:.2f})"
+            # response_text += debug_info
+            
+            client.chat_postMessage(
+                channel=channel_id,
+                text=response_text,
+                thread_ts=thread_ts # Reply in thread
+            )
+            logger.info(f"Responded to '{message_text}' with answer based on similarity score {similarity_score}.")
+        else:
+            logger.info(f"No sufficiently similar question found for '{message_text}'. Score: {similarity_score} (Threshold: {SIMILARITY_THRESHOLD})")
+            # Optionally, send a "not sure" message
+            # client.chat_postMessage(
+            #     channel=channel_id,
+            #     text="I'm not sure how to answer that. Can you try rephrasing?",
+            #     thread_ts=thread_ts
+            # )
+
+    except Exception as e:
+        logger.error(f"Error processing message for Q&A: {e}")
+        # Optionally, notify user of an error.
+        # client.chat_postMessage(
+        #     channel=channel_id,
+        #     text="Sorry, I encountered an error trying to answer your question.",
+        #     thread_ts=thread_ts
+        # )
+
 if __name__ == "__main__":
     # Start the app
     if TEST_MODE:
         print("Test mode active - database is initialized.")
+        if faiss_index:
+            print(f"FAISS index loaded with {faiss_index.ntotal} Q&A entries.")
+        else:
+            print("FAISS index for Q&A not loaded (check logs).")
+        
+        # Check if Ollama is presumably running by trying to make a request (optional)
+        # For simplicity, we'll just state the configured model.
+        print(f"Configured to use Ollama model: '{OLLAMA_MODEL_NAME}' via {OLLAMA_API_URL}")
+        print("Ensure Ollama is running and the model is available.")
+
         print("Commands available:")
         for cmd in app.commands:
             print(f"  {cmd}")
