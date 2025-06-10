@@ -1695,6 +1695,18 @@ if __name__ == "__main__":
 def handle_mongo_whitelist_command(ack, body, client, logger):
     """Opens a modal for the user to submit an IP whitelist request for MongoDB Atlas."""
     ack()
+    
+    # --- Admin User Check ---
+    requesting_user_id = body["user_id"]
+    if requesting_user_id != ADMIN_USER_ID:
+        client.chat_postEphemeral(
+            channel=body["channel_id"],
+            user=requesting_user_id,
+            text="Sorry, this command is restricted to administrators only."
+        )
+        logger.warning(f"Unauthorized user {requesting_user_id} attempted to use /mongo-whitelist.")
+        return
+
     try:
         client.views_open(
             trigger_id=body["trigger_id"],
