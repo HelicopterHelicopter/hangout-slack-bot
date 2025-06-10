@@ -1666,29 +1666,6 @@ def handle_message_events(body, client, logger):
         #     thread_ts=thread_ts
         # )
 
-if __name__ == "__main__":
-    # Start the app
-    if TEST_MODE:
-        print("Test mode active - database is initialized.")
-        if faiss_index:
-            print(f"FAISS index loaded with {faiss_index.ntotal} Q&A entries.")
-        else:
-            print("FAISS index for Q&A not loaded (check logs).")
-        
-        # Check if Ollama is presumably running by trying to make a request (optional)
-        # For simplicity, we'll just state the configured model.
-        print(f"Configured to use Ollama model: '{OLLAMA_MODEL_NAME}' via {OLLAMA_API_URL}")
-        print("Ensure Ollama is running and the model is available.")
-
-        print("Commands available:")
-        for cmd in app.commands:
-            print(f"  {cmd}")
-        print("\nViews registered:")
-        for view in app.views:
-            print(f"  {view}")
-    else:
-        handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
-        handler.start() 
 
 # --- MongoDB Atlas Whitelist Command ---
 @app.command("/mongo-whitelist")
@@ -1751,18 +1728,6 @@ def handle_mongo_whitelist_command(ack, body, client, logger):
                             "placeholder": {"type": "plain_text", "text": "e.g., Whitelisting for local testing"}
                         },
                         "label": {"type": "plain_text", "text": "Comment"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "delete_after_date_block",
-                        "optional": True,
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "delete_after_date_input",
-                            "placeholder": {"type": "plain_text", "text": "e.g., 2024-12-31T23:59:59Z"}
-                        },
-                        "label": {"type": "plain_text", "text": "Expiration Date (Optional)"},
-                        "hint": {"type": "plain_text", "text": "Use ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ"}
                     }
                 ]
             }
@@ -1871,3 +1836,27 @@ def handle_atlas_whitelist_submission(ack, body, client, view, logger):
             channel=requester_user["id"],
             text=f"An unexpected error occurred: `{e}`. Please contact an administrator."
         )
+
+if __name__ == "__main__":
+    # Start the app
+    if TEST_MODE:
+        print("Test mode active - database is initialized.")
+        if faiss_index:
+            print(f"FAISS index loaded with {faiss_index.ntotal} Q&A entries.")
+        else:
+            print("FAISS index for Q&A not loaded (check logs).")
+        
+        # Check if Ollama is presumably running by trying to make a request (optional)
+        # For simplicity, we'll just state the configured model.
+        print(f"Configured to use Ollama model: '{OLLAMA_MODEL_NAME}' via {OLLAMA_API_URL}")
+        print("Ensure Ollama is running and the model is available.")
+
+        print("Commands available:")
+        for cmd in app.commands:
+            print(f"  {cmd}")
+        print("\nViews registered:")
+        for view in app.views:
+            print(f"  {view}")
+    else:
+        handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+        handler.start() 
