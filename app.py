@@ -1818,24 +1818,31 @@ def handle_atlas_whitelist_submission(ack, body, client, view, logger):
             client.chat_postMessage(channel=original_channel_id, text=success_message)
             logger.info(f"Successfully whitelisted {ip_address} for user {requester_user['name']}.")
         else:
+            requester_user_id = requester_user['id']
             error_details = response.json().get("detail", "No details provided.")
             error_message = (f"❌ Failed to whitelist `{ip_address}` in *{environment}*.\n"
                              f"*Status Code:* {response.status_code}\n"
                              f"*Reason:* `{error_details}`\n"
                              f"Please check the IP address and try again, or contact an admin.")
-            client.chat_postMessage(channel=requester_user["id"], text=error_message)
+            client.chat_postEphemeral(
+                channel=original_channel_id,
+                user=requester_user_id,
+                text=error_message
+            )
             logger.error(f"Error from Atlas API: {response.status_code} - {response.text}")
 
     except requests.exceptions.Timeout:
         logger.error("Request to Atlas API timed out.")
-        client.chat_postMessage(
-            channel=requester_user["id"],
+        client.chat_postEphemeral(
+            channel=original_channel_id,
+            user=requester_user["id"],
             text="Sorry, the request to the MongoDB Atlas API timed out. Please try again later."
         )
     except Exception as e:
         logger.error(f"An unexpected error occurred during Atlas whitelist submission: {e}")
-        client.chat_postMessage(
-            channel=requester_user["id"],
+        client.chat_postEphemeral(
+            channel=original_channel_id,
+            user=requester_user["id"],
             text=f"An unexpected error occurred: `{e}`. Please contact an administrator."
         )
 
