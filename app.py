@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -13,6 +13,7 @@ import faiss # Added for Q&A
 import numpy as np # Added for Q&A
 import uuid # Though Chroma not used, uuid might be useful elsewhere. Keeping for now.
 import requests # Added for Ollama integration
+from requests.auth import HTTPDigestAuth # Added for Mongo Atlas API
 
 # Set up logging to debug the issue
 logging.basicConfig(level=logging.DEBUG)
@@ -40,6 +41,21 @@ else:
 
 
 ADMIN_USER_ID = "U07ADRA6HEH" # User ID to receive the DM
+
+# --- MongoDB Atlas Whitelist Configuration ---
+# Store these in your .env file
+ATLAS_CONFIG = {
+    "dev": {
+        "group_id": os.environ.get("DEV_ATLAS_GROUP_ID"),
+        "public_key": os.environ.get("DEV_ATLAS_PUBLIC_KEY"),
+        "private_key": os.environ.get("DEV_ATLAS_PRIVATE_KEY")
+    },
+    "stage": {
+        "group_id": os.environ.get("STAGE_ATLAS_GROUP_ID"),
+        "public_key": os.environ.get("STAGE_ATLAS_PUBLIC_KEY"),
+        "private_key": os.environ.get("STAGE_ATLAS_PRIVATE_KEY")
+    }
+}
 
 if TEST_MODE:
     # Mock App for testing
@@ -1673,3 +1689,173 @@ if __name__ == "__main__":
     else:
         handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
         handler.start() 
+
+# --- MongoDB Atlas Whitelist Command ---
+@app.command("/mongo-whitelist")
+def handle_mongo_whitelist_command(ack, body, client, logger):
+    """Opens a modal for the user to submit an IP whitelist request for MongoDB Atlas."""
+    ack()
+    try:
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "atlas_whitelist_modal_submission",
+                "title": {"type": "plain_text", "text": "Whitelist IP in Atlas"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "ip_address_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "ip_address_input",
+                            "placeholder": {"type": "plain_text", "text": "e.g., 192.168.1.100 or 10.0.0.0/24"}
+                        },
+                        "label": {"type": "plain_text", "text": "IP Address or CIDR Block"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "environment_block",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "environment_select",
+                            "placeholder": {"type": "plain_text", "text": "Select an environment"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Development"}, "value": "dev"},
+                                {"text": {"type": "plain_text", "text": "Staging"}, "value": "stage"}
+                            ]
+                        },
+                        "label": {"type": "plain_text", "text": "Environment"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "comment_block",
+                        "optional": True,
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "comment_input",
+                            "placeholder": {"type": "plain_text", "text": "e.g., Whitelisting for local testing"}
+                        },
+                        "label": {"type": "plain_text", "text": "Comment"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "delete_after_date_block",
+                        "optional": True,
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "delete_after_date_input",
+                            "placeholder": {"type": "plain_text", "text": "e.g., 2024-12-31T23:59:59Z"}
+                        },
+                        "label": {"type": "plain_text", "text": "Expiration Date (Optional)"},
+                        "hint": {"type": "plain_text", "text": "Use ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ"}
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error opening Atlas whitelist modal: {e}")
+        client.chat_postMessage(
+            channel=body["user_id"],
+            text=f"Sorry, I couldn't open the form. An error occurred: {e}"
+        )
+
+
+@app.view("atlas_whitelist_modal_submission")
+def handle_atlas_whitelist_submission(ack, body, client, view, logger):
+    """Handles the submission of the Atlas IP whitelist modal."""
+    values = view["state"]["values"]
+    requester_user = body["user"]
+
+    ip_address = values["ip_address_block"]["ip_address_input"]["value"]
+    environment = values["environment_block"]["environment_select"]["selected_option"]["value"]
+    comment = values["comment_block"]["comment_input"].get("value")
+    
+    # --- Validation ---
+    errors = {}
+    if not ip_address:
+        errors["ip_address_block"] = "IP Address or CIDR Block is required."
+    
+    if errors:
+        ack(response_action="errors", errors=errors)
+        return
+
+    # Acknowledge the modal submission immediately
+    ack()
+
+    try:
+        # --- Select Config ---
+        config = ATLAS_CONFIG.get(environment)
+        if not config or not all(config.values()):
+            client.chat_postMessage(
+                channel=requester_user["id"],
+                text=f"Configuration for environment '{environment}' is missing or incomplete. Please contact an administrator."
+            )
+            return
+
+        # --- Calculate expiration date (6 hours from now) ---
+        expiration_date = datetime.now(timezone.utc) + timedelta(hours=6)
+        delete_after_date_str = expiration_date.isoformat().replace('+00:00', 'Z')
+
+
+        # --- Construct API Call ---
+        url = f"https://cloud.mongodb.com/api/atlas/v2/groups/{config['group_id']}/accessList"
+        
+        # Add user's name and ID to the comment for tracking
+        full_comment = f"Added by {requester_user['name']} ({requester_user['id']}) via Slack Bot."
+        if comment:
+            full_comment += f" Comment: {comment}"
+
+        payload_entry = {
+            "comment": full_comment,
+            "deleteAfterDate": delete_after_date_str
+        }
+        # The API uses either ipAddress or cidrBlock, not both.
+        if "/" in ip_address:
+            payload_entry["cidrBlock"] = ip_address
+        else:
+            payload_entry["ipAddress"] = ip_address
+
+        payload = [payload_entry]
+
+        headers = {
+            "Accept": "application/vnd.atlas.2025-03-12+json",
+            "Content-Type": "application/json"
+        }
+
+        auth = HTTPDigestAuth(config['public_key'], config['private_key'])
+
+        # --- Make API Call ---
+        logger.info(f"Making Atlas API request to whitelist {ip_address} in '{environment}' environment.")
+        response = requests.post(url, headers=headers, json=payload, auth=auth, timeout=20)
+
+        # Check for successful response (201 is 'Created')
+        if response.status_code == 201:
+            success_message = (f"✅ Successfully submitted whitelist request for `{ip_address}` "
+                               f"in the *{environment}* environment.\n"
+                               f"It may take a few moments to apply.")
+            client.chat_postMessage(channel=requester_user["id"], text=success_message)
+            logger.info(f"Successfully whitelisted {ip_address} for user {requester_user['name']}.")
+        else:
+            error_details = response.json().get("detail", "No details provided.")
+            error_message = (f"❌ Failed to whitelist `{ip_address}` in *{environment}*.\n"
+                             f"*Status Code:* {response.status_code}\n"
+                             f"*Reason:* `{error_details}`\n"
+                             f"Please check the IP address and try again, or contact an admin.")
+            client.chat_postMessage(channel=requester_user["id"], text=error_message)
+            logger.error(f"Error from Atlas API: {response.status_code} - {response.text}")
+
+    except requests.exceptions.Timeout:
+        logger.error("Request to Atlas API timed out.")
+        client.chat_postMessage(
+            channel=requester_user["id"],
+            text="Sorry, the request to the MongoDB Atlas API timed out. Please try again later."
+        )
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during Atlas whitelist submission: {e}")
+        client.chat_postMessage(
+            channel=requester_user["id"],
+            text=f"An unexpected error occurred: `{e}`. Please contact an administrator."
+        )
