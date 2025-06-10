@@ -1666,7 +1666,6 @@ def handle_message_events(body, client, logger):
         #     thread_ts=thread_ts
         # )
 
-
 # --- MongoDB Atlas Whitelist Command ---
 @app.command("/mongo-whitelist")
 def handle_mongo_whitelist_command(ack, body, client, logger):
@@ -1689,6 +1688,7 @@ def handle_mongo_whitelist_command(ack, body, client, logger):
             trigger_id=body["trigger_id"],
             view={
                 "type": "modal",
+                "private_metadata": body["channel_id"],
                 "callback_id": "atlas_whitelist_modal_submission",
                 "title": {"type": "plain_text", "text": "Whitelist IP in Atlas"},
                 "submit": {"type": "plain_text", "text": "Submit"},
@@ -1743,6 +1743,7 @@ def handle_mongo_whitelist_command(ack, body, client, logger):
 @app.view("atlas_whitelist_modal_submission")
 def handle_atlas_whitelist_submission(ack, body, client, view, logger):
     """Handles the submission of the Atlas IP whitelist modal."""
+    original_channel_id = view["private_metadata"]
     values = view["state"]["values"]
     requester_user = body["user"]
 
@@ -1810,10 +1811,11 @@ def handle_atlas_whitelist_submission(ack, body, client, view, logger):
 
         # Check for successful response (201 is 'Created')
         if response.status_code == 201:
-            success_message = (f"✅ Successfully submitted whitelist request for `{ip_address}` "
-                               f"in the *{environment}* environment.\n"
+            requester_user_id = requester_user['id']
+            success_message = (f"✅ IP whitelist request for `{ip_address}` in the *{environment}* environment "
+                               f"was successful.\n"
                                f"It may take a few moments to apply.")
-            client.chat_postMessage(channel=requester_user["id"], text=success_message)
+            client.chat_postMessage(channel=original_channel_id, text=success_message)
             logger.info(f"Successfully whitelisted {ip_address} for user {requester_user['name']}.")
         else:
             error_details = response.json().get("detail", "No details provided.")
