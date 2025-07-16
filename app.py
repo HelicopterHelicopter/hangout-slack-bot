@@ -40,7 +40,7 @@ else:
     logger.info("SLACK_LISTEN_CHANNEL_IDS not set or empty. Q&A bot will listen on all channels it is a member of.")
 
 
-ADMIN_USER_ID = "U07ADRA6HEH" # User ID to receive the DM
+ADMIN_USER_IDS = ["U07ADRA6HEH", "U07NMLS2FEE"] # User IDs to receive DMs and have admin access
 
 # --- MongoDB Atlas Whitelist Configuration ---
 # Store these in your .env file
@@ -1555,24 +1555,36 @@ def handle_archive_request_submission(ack, body, client, view, logger):
     config_lines.append("```")
     message_text = "\n".join(config_lines)
 
-    # --- Send DM to Admin --- 
-    # (DM Sending Logic Remains the Same)
+    # --- Send DM to All Admins --- 
+    # Send DM to each admin user
     try:
-        dm_result = client.chat_postMessage(
-            channel=ADMIN_USER_ID,
-            text=message_text,
-            mrkdwn=True # Ensure markdown formatting is applied
-        )
-        logger.info(f"Sent archive request DM (channel: {dm_result.get('channel')}) to {ADMIN_USER_ID} from {requester_user_id}")
-
-        # Optionally send confirmation to the user who submitted
+        sent_to_admins = []
+        failed_admins = []
+        
+        for admin_user_id in ADMIN_USER_IDS:
+            try:
+                dm_result = client.chat_postMessage(
+                    channel=admin_user_id,
+                    text=message_text,
+                    mrkdwn=True # Ensure markdown formatting is applied
+                )
+                sent_to_admins.append(admin_user_id)
+                logger.info(f"Sent archive request DM (channel: {dm_result.get('channel')}) to {admin_user_id} from {requester_user_id}")
+            except Exception as admin_e:
+                failed_admins.append(admin_user_id)
+                logger.error(f"Error sending DM to admin {admin_user_id}: {admin_e}")
+        
+        # Send confirmation to the user who submitted
         client.chat_postMessage(
              channel=requester_user_id,
              text="Your archive request has been submitted for review."
         )
+        
+        if failed_admins:
+            logger.warning(f"Failed to send archive request DM to admins: {failed_admins}")
 
     except Exception as e:
-        logger.error(f"Error sending DM to {ADMIN_USER_ID} or confirmation to {requester_user_id}: {e}")
+        logger.error(f"Error sending DMs to admins or confirmation to {requester_user_id}: {e}")
         # Optionally inform the submitting user about the error
         try:
              client.chat_postMessage(
@@ -1674,7 +1686,7 @@ def handle_mongo_whitelist_command(ack, body, client, logger):
     
     # --- Admin User Check ---
     requesting_user_id = body["user_id"]
-    if requesting_user_id != ADMIN_USER_ID:
+    if requesting_user_id not in ADMIN_USER_IDS:
         client.chat_postEphemeral(
             channel=body["channel_id"],
             user=requesting_user_id,
